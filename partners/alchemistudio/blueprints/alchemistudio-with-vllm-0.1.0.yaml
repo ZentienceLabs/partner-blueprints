@@ -6,7 +6,7 @@
 #
 # HOW THE LINKING WORKS (a chain of matching identifiers):
 #   vLLM modelSpec.modelURL = "Qwen/Qwen2.5-3B-Instruct"   (vLLM serves this)
-#        -> router at http://vllm-router-service.vllm-serve.svc:80/v1
+#        -> router at http://vllm-router-service:80/v1  (same namespace as the app)
 #   AlchemiStudio seed (selfHostedModel):
 #     config_providers.endpoint_url  = that router URL,  litellm_provider=custom_openai
 #     config_models.deployment_name  = "Qwen/Qwen2.5-3B-Instruct"  == modelURL (MUST match)
@@ -17,8 +17,10 @@
 #
 # COMPONENTS:
 #   1. alchemistudio-platform (umbrella)  -> the app + bundled TEI embeddings + the model seed
-#   2. vllm                          -> Qwen2.5-3B on the GPU (tool-calling + enforce-eager),
-#                                       in its own namespace (vllm-serve) by design
+#   2. vllm                          -> Qwen2.5-3B on the GPU (tool-calling + enforce-eager)
+#
+# Both components install into the namespace you pick in the install wizard (no
+# targetNamespace is pinned), so several instances can share a cluster.
 #
 # See partners/alchemistudio/README.md for the step-by-step install and the
 # namespace/resource table.
@@ -53,7 +55,7 @@ spec:
       * REAL DOMAIN (production): set global.domain (e.g. alchemi.acme.com). Each app is
         served at <subdomain>.<domain>: alchemi-app.<domain> (web), alchemi-auth.<domain>
         (login), alchemi-ops.<domain> (observability), alchemi-zenith.<domain>. After
-        install, read the gateway IP (kubectl -n apisix get svc apisix-gateway) and point a
+        install, read the gateway IP (kubectl -n <namespace> get svc apisix-gateway) and point a
         DNS A-record for each <subdomain>.<domain> at it; the TLS cert issues automatically
         once DNS resolves.
       * STATIC IP, NO DOMAIN (test / DNS-less): leave global.domain blank and set
@@ -63,13 +65,23 @@ spec:
         global.wildcardDns: sslip.io (same behaviour). gateway.loadBalancerIP is ONE
         portable knob: it works on bare-metal (MetalLB) AND Azure (the IP must be a
         pre-reserved Public IP in the cluster's own resource group).
-      Set your choice by EDITING this Blueprint BEFORE you register it. The FleetBundle path
-      renders the Blueprint's baked values — AIWorkload componentValues are NOT applied to
-      blueprint components, so editing the Blueprint YAML is the only way to configure it.
+      Set your choice either in this Blueprint's values below, or at install time: values
+      given in the install wizard (AIWorkload spec.componentValues) are applied to the
+      blueprint components and override the baked defaults.
+
+    REACHING THE APP — the APISIX gateway (apisix-gateway Service) fronts every hostname:
+      * gateway.serviceType=auto (default) = a LoadBalancer Service. Your cluster needs a
+        LoadBalancer provider (cloud provider, MetalLB, ...); without one it stays <pending>.
+      * No LoadBalancer? Set gateway.serviceType=ClusterIP and route the hostnames to
+        apisix-gateway through the cluster's ingress controller (Traefik on RKE2) with TLS
+        passthrough, and use global.domain=<ingress-ip>.sslip.io (NOT loadBalancerIP, which
+        assumes APISIX owns the IP). Tested Traefik example in the README.
 
     TLS:
       * tls.mode=acme (default): free Let's Encrypt cert via HTTP-01 — the hostnames must
-        resolve to the gateway IP and port 80 be reachable from the internet BEFORE install.
+        resolve to the gateway (or ingress) IP and port 80 be reachable from the internet.
+        The challenge is answered by the cluster's ingress controller: tls.acme.ingressClass
+        (default traefik, RKE2's default; set nginx for rke2-ingress-nginx).
       * tls.mode=byo: paste your own cert + key (tls.certPem / tls.keyPem).
 
     ADMIN: defaults to suse-admin@alchemistudio.ai with a TEMPORARY demo password (Keycloak
@@ -114,35 +126,33 @@ spec:
         as standard containers on any Linux node (RKE2 doesn't ship Kata). For production /
         multi-user installs, prepare a Kata node and set kata.enabled=true for VM-level
         isolation of user code (see the README).
-      * Storage — three StorageClasses (names are set in the component values below):
+      * A LoadBalancer provider for the apisix-gateway Service — or the ClusterIP + ingress
+        path described under REACHING THE APP.
+      * Storage — Longhorn for everything by default (one storage provider):
           - ReadWriteOnce class for the platform data (Postgres, Redis, SeaweedFS, etcd,
             OpenBao): global.storageClass, default "longhorn".
           - ReadWriteMany class for the shared AIOS / file data volume (mounted by several
             pods at once): aios.dataPlane.storageClass, default "longhorn" (Longhorn RWX
             needs an NFS client on the nodes). Any RWX-capable class works, e.g. NFS.
-          - "local-path" for the vLLM model cache (the GPU node is typically NOT a Longhorn
-            node, so a node-local class is required).
-        If your cluster has no Longhorn, set the first two to your own classes before
-        registering the blueprint, or the data pods stay Pending on unbound PVCs.
+          - ReadWriteOnce class for the vLLM model cache: the vllm component's storageClass,
+            default "longhorn". If the GPU node is not a Longhorn node, use a node-local
+            class such as "local-path" instead.
+        Without Longhorn, set all three to your own classes, or the pods stay Pending on
+        unbound PVCs.
       * cert-manager on the cluster for tls.mode=acme (or your own cert for byo).
       * Egress to pull the vLLM + TEI images (dp.apps.rancher.io, ghcr.io) and the Qwen +
         bge-small weights (huggingface.co). Mirror all of these for an air-gapped install.
 
-    NAMESPACES — the alchemistudio-platform chart creates (and removes on uninstall) its own
-    namespaces; the blueprint's target namespace is "alchemi":
-      alchemi           app tier: web, ai, worker, workflow, zenith, compute-api, embeddings (TEI), AIOS workers
-      alchemi-data      pgvector (Postgres), Redis, SeaweedFS object store
-      auth              Keycloak (login / OIDC)
-      observability     OpenObserve (logs/metrics/traces)
-      albox             code sandboxes + AIOS computer (Kata micro-VMs when kata.enabled=true)
-      apisix            APISIX gateway + etcd (the "apisix-gateway" LoadBalancer = the external IP)
-      openbao           OpenBao (secrets store)
-      external-secrets  External Secrets Operator
-      vllm-serve        vLLM engine + router (GPU) — separate ON PURPOSE: keeps the GPU model
-                        server independently managed, quota-able and replaceable (e.g. swap the
-                        model) without touching the platform namespaces.
+    NAMESPACE — everything (both components) installs into the ONE namespace you pick in
+    the install wizard; the chart creates no namespaces of its own. Several AlchemiStudio
+    instances can run on one cluster, one per namespace, each with its own domain / IP.
+    Optional: set global.namespaceMode=split in the platform values to give each tier its
+    own namespace, "<global.namespacePrefix>-<tier>" (prefix default "alchemistudio"; use a
+    different prefix per instance). The app tier and vLLM stay in the wizard namespace.
 
     SETUP (kubectl) — no secrets to pre-create (unlike gated-model blueprints); just:
+
+      NS=<the namespace you picked in the install wizard>
 
       # 1) BEFORE deploying — confirm a free GPU for vLLM (it needs one whole GPU):
       for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
@@ -158,30 +168,30 @@ spec:
       #    You need Free >= 1 on at least one node. If every GPU is taken, scale down the
       #    workload using it before installing.
 
-      # 2) AFTER install — wait for the APISIX gateway (namespace "apisix") to get an
-      #    external IP. This IP fronts every AlchemiStudio hostname:
-      kubectl -n apisix get svc apisix-gateway -w        # wait until EXTERNAL-IP is set, Ctrl+C
+      # 2) AFTER install — wait for the APISIX gateway to get an external IP. This IP
+      #    fronts every AlchemiStudio hostname:
+      kubectl -n "$NS" get svc apisix-gateway -w        # wait until EXTERNAL-IP is set, Ctrl+C
       #    Real domain: point a DNS A-record for each <subdomain>.<domain> at that IP.
       #    Static-IP / nip.io path: nothing to do — the host already resolves to the IP.
       #    Then get the app URLs (computed from your domain + the branded subdomains, so you
       #    don't have to assemble them by hand — for a nip.io test they resolve automatically):
-      kubectl -n alchemi get configmap alchemi-endpoints \
+      kubectl -n "$NS" get configmap alchemi-endpoints \
         -o jsonpath='App:  {.data.APP_URL}{"\n"}Auth: https://{.data.AUTH_HOST}{"\n"}' ; echo
-      kubectl -n alchemi get configmap alchemi-endpoints \
+      kubectl -n "$NS" get configmap alchemi-endpoints \
         -o jsonpath='Ops:  https://{.data.OPS_HOST}{"\n"}' ; echo
 
       # 3) LOGIN CREDENTIALS (admin) — retrieve via kubectl. Keycloak forces a password
       #    reset on first login (the app password below is the INITIAL one).
       #    Username / email:
-      kubectl -n alchemi get configmap alchemi-endpoints -o jsonpath='{.data.ADMIN_EMAIL}' ; echo
+      kubectl -n "$NS" get configmap alchemi-endpoints -o jsonpath='{.data.ADMIN_EMAIL}' ; echo
       #    App login password:
-      kubectl -n alchemi get secret alchemi-secrets -o jsonpath='{.data.FIRST_USER_PASSWORD}' | base64 -d ; echo
+      kubectl -n "$NS" get secret alchemi-secrets -o jsonpath='{.data.FIRST_USER_PASSWORD}' | base64 -d ; echo
       #    Keycloak admin-console password (only if you need the KC admin UI):
-      kubectl -n alchemi get secret alchemi-secrets -o jsonpath='{.data.KC_ADMIN_PASSWORD}' | base64 -d ; echo
+      kubectl -n "$NS" get secret alchemi-secrets -o jsonpath='{.data.KC_ADMIN_PASSWORD}' | base64 -d ; echo
 
       # 4) VERIFY the model wiring seeded (provider + model, account-scoped to the login
       #    account; the Copilot picker needs pricing + a non-empty provider credential):
-      kubectl -n alchemi-data exec alchemi-pgvector-0 -- \
+      kubectl -n "$NS" exec alchemi-pgvector-0 -- \
         psql -U alchemiadmin -d alchemiapp_db \
         -c "select m.scope, m.provider_id, m.deployment_name, m.input_cost_per_million, p.encrypted_credentials \
             from config_models m join config_providers p on p.id=m.provider_id \
@@ -195,15 +205,13 @@ spec:
     # same certified chart published via rancher/partner-charts (see PREREQUISITES).
     - chartName: alchemistudio-platform
       chartRepo: http-partner-charts
-      chartVersion: "1.0.25"                 # optional Kata + global.wildcardDns (nip.io | sslip.io)
-      targetNamespace: alchemi
+      chartVersion: "1.1.0"                  # single namespace + multi-instance (+ optional Kata, sslip.io)
       values:
         global:
-          # Hostname source — set EITHER this domain OR gateway.loadBalancerIP (below).
+          # Hostname source — set EITHER this domain OR gateway.loadBalancerIP (below), here
+          # or at install time (install-wizard component values override these defaults).
           # With a domain, point DNS A-records for each <subdomain>.<domain> at the APISIX
-          # gateway IP after install (kubectl -n apisix get svc apisix-gateway). Set it HERE
-          # before registering the Blueprint (AIWorkload componentValues are NOT applied to
-          # blueprint components).
+          # gateway IP after install (kubectl -n <namespace> get svc apisix-gateway).
           # REAL-DOMAIN path: e.g. alchemi.acme.com. Leave "" to use the STATIC-IP path (set
           # gateway.loadBalancerIP below). Install fails ONLY if BOTH are blank.
           domain: ""
@@ -244,7 +252,14 @@ spec:
         # message (no usable hostname). See 0.1.0/README.md for the domain vs static-IP paths.
         # gateway:
         #   loadBalancerIP: "203.0.113.10"    # <- your reserved static IP
-        tls: { enabled: true, mode: acme }    # acme (Let's Encrypt) or byo (paste cert)
+        #   serviceType: ClusterIP            # <- no LoadBalancer provider: front APISIX with
+        #                                     #    the cluster ingress (see README), and set
+        #                                     #    global.domain: <ingress-ip>.sslip.io
+        tls:
+          enabled: true
+          mode: acme                          # acme (Let's Encrypt) or byo (paste cert)
+          acme:
+            ingressClass: traefik             # ingress controller that answers HTTP-01 (nginx for rke2-ingress-nginx)
         guardrails: { enabled: false }        # keep first install fast
         # Kata OFF: code sandboxes run as standard containers on any Linux node, so a stock
         # RKE2 cluster works. Set true (and prepare a Kata node) for VM-level isolation.
@@ -258,7 +273,7 @@ spec:
         selfHostedModel:
           enabled: true
           chat:
-            endpointUrl: "http://vllm-router-service.vllm-serve.svc.cluster.local:80/v1"
+            endpointUrl: "http://vllm-router-service:80/v1"   # same namespace as the app
             model: "Qwen/Qwen2.5-3B-Instruct"      # MUST equal the vLLM modelURL below
             setAsCopilotDefault: true
           embedding:
@@ -270,7 +285,6 @@ spec:
     - chartName: vllm
       chartRepo: application-collection
       chartVersion: "0.1.10"
-      targetNamespace: vllm-serve
       values:
         global:
           imageRegistry: ""
@@ -295,7 +309,8 @@ spec:
               requestGPU: 1
               pvcStorage: "20Gi"
               pvcAccessMode: ["ReadWriteOnce"]
-              storageClass: "local-path"                # GPU node is not Longhorn
+              # One storage provider (Longhorn); use "local-path" if the GPU node isn't a Longhorn node.
+              storageClass: "longhorn"
               vllmConfig:
                 dtype: "half"                            # T4 = Turing, no bf16
                 # 64K context — REQUIRED for AIOS. The AIOS Hermes agent hard-rejects any
